@@ -1,0 +1,640 @@
+# ============================
+# Imports
+# ============================
+import logging
+import os
+import numpy as np
+import streamlit as st
+import requests
+import pandas as pd
+from io import StringIO
+from Bio.PDB import PDBParser, NeighborSearch
+from Bio.PDB.SASA import ShrakeRupley
+from Bio.Align import PairwiseAligner
+import streamlit.components.v1 as components
+import py3Dmol
+import json
+import time
+
+# ============================
+# ثوابت
+# ============================
+
+AA_3TO1 = {
+    'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
+    'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+    'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
+    'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
+}
+
+AA_PROPS = {
+    'ALA': 'غير قطبي (Non-polar)',       'ARG': 'قاعدي (+)',
+    'ASN': 'قطبي غير مشحون (Polar)',     'ASP': 'حمضي (-)',
+    'CYS': 'قطبي غير مشحون (Polar)',     'GLN': 'قطبي غير مشحون (Polar)',
+    'GLU': 'حمضي (-)',                    'GLY': 'غير قطبي (Non-polar)',
+    'HIS': 'قاعدي (+)',                   'ILE': 'غير قطبي (Non-polar)',
+    'LEU': 'غير قطبي (Non-polar)',        'LYS': 'قاعدي (+)',
+    'MET': 'غير قطبي (Non-polar)',        'PHE': 'عطري غير قطبي (Aromatic)',
+    'PRO': 'غير قطبي (Non-polar)',        'SER': 'قطبي غير مشحون (Polar)',
+    'THR': 'قطبي غير مشحون (Polar)',     'TRP': 'عطري غير قطبي (Aromatic)',
+    'TYR': 'عطري قطبي (Aromatic)',       'VAL': 'غير قطبي (Non-polar)'
+}
+
+# ============================
+# دوال مساعدة
+# ============================
+
+@st.cache_data(ttl=3600)
+def fetch_pdb_data(pdb_id):
+    if not pdb_id or pdb_id == "NONE":
+        return None
+        
+    # 1. البحث في المجلد المحلي أولاً
+    local_dir = "Protein_Database_100"
+    local_file_path = os.path.join(local_dir, f"pdb{pdb_id.lower()}.ent")
+    
+    if os.path.exists(local_file_path):
+        try:
+            with open(local_file_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            st.warning(f"حدث خطأ أثناء قراءة الملف المحلي: {e}")
+
+    # 2. في حال لم يكن موجوداً محلياً، جلبه من الإنترنت
+    url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+    try:
+        response = requests.get(url, timeout=15)
+        if response.status_code == 200:
+            return response.text
+        else:
+            return None
+    except Exception as e:
+        st.error(f"خطأ في الاتصال: {e}")
+        return None
+
+
+def process_protein_structure(pdb_string, pdb_id, keep_hetatm=False):
+    try:
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure(pdb_id, StringIO(pdb_string))
+        if not keep_hetatm:
+            for model in structure:
+                for chain in model:
+                    for r_id in [r.get_id() for r in chain if r.get_id()[0] != ' ']:
+                        chain.detach_child(r_id)
+        return structure
+    except Exception as e:
+        logging.error(f"فشل قراءة البنية: {e}")
+        st.error(f"خطأ: {e}")
+        return None
+
+
+def get_all_chains(structure):
+    try:
+        return [chain.id for chain in structure[0]]
+    except Exception as ex:
+        logging.warning(f"فشل قراءة السلاسل: {ex}")
+        return []
+
+
+def get_protein_sequence(structure, chain_id):
+    sequence = []
+    try:
+        model = structure[0]
+        if chain_id in [c.id for c in model]:
+            for residue in model[chain_id]:
+                if residue.id[0] == ' ':
+                    sequence.append({
+                        'رقم البقية': residue.id[1],
+                        'الحمض الأميني': residue.get_resname()
+                    })
+    except Exception as ex:
+        logging.warning(f"فشل قراءة تسلسل السلسلة {chain_id}: {ex}")
+    return sequence
+
+
+def sequence_to_fasta(structure, chain_id, protein_name="protein"):
+    seq_data = get_protein_sequence(structure, chain_id)
+    if not seq_data:
+        return None
+    one_letter = ''.join([AA_3TO1.get(r['الحمض الأميني'], 'X') for r in seq_data])
+    lines = [one_letter[i:i+80] for i in range(0, len(one_letter), 80)]
+    header = f">{protein_name}|Chain_{chain_id}|length={len(one_letter)}\n"
+    body = '\n'.join(lines) + '\n'
+    return header + body
+
+
+@st.cache_data(ttl=3600)
+def calculate_all_distances(_structure_key, pdb_string, chain_id, radius=5.0, keep_hetatm=False):
+    """
+    يحسب المسافات + SASA + الخصائص الكيميائية لكل الأحماض الأمينية.
+    تحسينات NumPy:
+      - استخراج كل الإحداثيات مرة واحدة (float32) + index slicing
+      - diff * diff بدل ** 2، sqrt مرة واحدة على القيمة الدنيا فقط
+      - ShrakeRupley يحسب SASA مرة واحدة قبل الحلقة
+    """
+    structure = process_protein_structure(pdb_string, "prot", keep_hetatm)
+    if not structure:
+        return []
+
+    try:
+        model = structure[0]
+        if chain_id not in [c.id for c in model]:
+            return []
+
+        # SASA — مرة واحدة لكل البنية
+        sr = ShrakeRupley()
+        sr.compute(structure, level='R')
+
+        # تجهيز البيانات
+        all_atoms   = list(model.get_atoms())
+        all_coords  = np.array([a.get_coord() for a in all_atoms], dtype=np.float32)
+        atom_to_idx = {atom: i for i, atom in enumerate(all_atoms)}
+        ns          = NeighborSearch(all_atoms)
+        residues    = [r for r in model[chain_id] if r.id[0] == ' ']
+
+        results = []
+        for target_res in residues:
+            target_atoms   = list(target_res.get_atoms())
+            target_indices = [atom_to_idx[a] for a in target_atoms]
+            target_coords  = all_coords[target_indices]
+
+            # إيجاد ذرات المجاورين
+            nearby_idx_set = set()
+            for atom in target_atoms:
+                for nb_atom in ns.search(atom.coord, radius):
+                    res = nb_atom.get_parent()
+                    if res.id[1] != target_res.id[1] or res.get_parent().id != chain_id:
+                        nearby_idx_set.add(atom_to_idx[nb_atom])
+
+            # حساب أقرب مسافة
+            min_dist = None
+            if nearby_idx_set:
+                nb_coords = all_coords[list(nearby_idx_set)]
+                diff      = target_coords[:, np.newaxis, :] - nb_coords[np.newaxis, :, :]
+                min_dist  = round(float(np.sqrt((diff * diff).sum(axis=-1).min())), 2)
+
+            # SASA
+            resname = target_res.get_resname()
+            try:
+                sasa_val = round(target_res.sasa, 2)
+            except AttributeError:
+                sasa_val = '-'
+
+            if min_dist is not None:
+                dist_display = min_dist
+            else:
+                dist_display = '-'
+
+            results.append({
+                'Chain'          : chain_id,
+                'Residue Num'    : target_res.id[1],
+                'Residue'        : resname,
+                'One-Letter'     : AA_3TO1.get(resname, 'X'),
+                'الخصائص'        : AA_PROPS.get(resname, '-'),
+                'عدد المجاورين'  : len(nearby_idx_set),
+                'أقرب مسافة (Å)': dist_display,
+                'SASA (Å²)'      : sasa_val
+            })
+
+        return results
+
+    except Exception as e:
+        logging.warning(f"خطأ في calculate_all_distances: {e}")
+        st.error(f"خطأ أثناء حساب المسافات: {e}")
+        return []
+
+
+def render_protein_3d(pdb_string, bg_color='#0E1117', style_type='cartoon',
+                      show_surface=True, surface_opacity=0.3, mutations=None,
+                      mut_color='red', zoom_to_mutations=False,
+                      focus_mut=None, keep_hetatm=False):
+    view = py3Dmol.view(width="100%", height=450)
+    view.addModel(pdb_string, 'pdb')
+    view.setBackgroundColor(bg_color)
+
+    style_dict = {}
+    if style_type == 'cartoon':
+        style_dict['cartoon'] = {'color': 'spectrum'}
+    elif style_type == 'stick':
+        style_dict['stick'] = {'color': 'spectrum'}
+    elif style_type == 'sphere':
+        style_dict['sphere'] = {'color': 'spectrum'}
+    else:
+        style_dict['cartoon'] = {'color': 'spectrum'}
+
+    view.setStyle({'model': -1}, style_dict)
+
+    if keep_hetatm:
+        view.addStyle({'hetflag': True}, {'stick': {'colorscheme': 'magentaCarbon', 'radius': 0.2}})
+
+    if show_surface:
+        view.addSurface(py3Dmol.SAS, {'opacity': surface_opacity, 'color': '#FFC107'})
+
+    if mutations:
+        for mut in mutations:
+            view.addStyle(mut, {style_type: {'color': mut_color}})
+            view.addStyle(mut, {'stick'  : {'colorscheme': 'yellowCarbon', 'radius': 0.3}})
+            view.addStyle(mut, {'sphere' : {'color': mut_color, 'radius': 1.2}})
+
+    if focus_mut:
+        view.zoomTo(focus_mut)
+    elif zoom_to_mutations and mutations:
+        view.zoomTo({'or': mutations})
+    else:
+        view.zoomTo()
+
+    return view._make_html()
+
+
+def get_alignment(seq1, seq2, mode='global'):
+    aligner = PairwiseAligner()
+    aligner.mode = mode
+    try:
+        best_aln = aligner.align(seq1, seq2)[0]
+    except Exception:
+        return "", 0, "", ""
+    return str(best_aln), best_aln.score, best_aln[0], best_aln[1]
+
+
+# ============================
+# قاعدة بيانات الطفرات (دعم التحميل من GitHub)
+# ============================
+# ملاحظة: استبدل هذا الرابط برابط ملف الـ JSON الخام (Raw) الخاص بك على GitHub
+REMOTE_JSON_URL = "https://raw.githubusercontent.com/hassan2006-web/Bio-project/refs/heads/main/mutations.json"
+
+@st.cache_data(ttl=300)
+def load_mutation_db():
+    url_with_cache_bypass = f"{REMOTE_JSON_URL}?t={int(time.time())}"
+    try:
+        response = requests.get(url_with_cache_bypass, timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+
+    json_path = 'mutations.json'
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+MUTATION_DB = load_mutation_db()
+
+def auto_fill_healthy():
+    m_id = st.session_state.get('m_id_in', '').upper().strip()
+    if m_id in MUTATION_DB:
+        st.session_state['h_id_in'] = MUTATION_DB[m_id]
+
+
+# ============================
+# التطبيق الرئيسي
+# ============================
+
+def main():
+    st.set_page_config(page_title="Bio-Impact Analyzer", page_icon="🧬", layout="wide")
+    st.title("🧬 Bio-Impact Analyzer")
+
+    # ── Sidebar ──
+    st.sidebar.header("⚙️ إعدادات التحليل")
+    search_radius  = st.sidebar.slider("🔍 نصف قطر البحث (Å)", 3.0, 12.0, 5.0)
+    view_style     = st.sidebar.selectbox("🎨 نمط العرض", ["cartoon", "stick", "sphere"])
+    show_surf      = st.sidebar.checkbox("إظهار السطح (Surface)", value=False)
+    surface_op     = st.sidebar.slider("شفافية السطح", 0.0, 1.0, 0.3)
+    show_mutations = st.sidebar.checkbox("🧬 تلوين الطفرات", value=False)
+    zoom_mutations = st.sidebar.checkbox("🔍 تركيز العرض على الطفرات", value=False)
+    st.sidebar.divider()
+    st.sidebar.subheader("🌟 إضافات التحليل المتقدم")
+    keep_hetatm = st.sidebar.checkbox("💊 الإبقاء على الأدوية (Ligands)", value=False)
+    align_mode  = st.sidebar.selectbox("🧬 نوع المحاذاة (Alignment)", ["global", "local"])
+    st.sidebar.warning("التحليل الهيكلي يشمل البحث في جميع سلاسل البروتين.")
+
+    bg_h = "#0D1B1E"
+    bg_m = "#1E0D0D"
+    col1, col2 = st.columns(2)
+
+    proteins = [
+        {"label": "السليم", "prefix": "h", "col": col1, "bg": bg_h},
+        {"label": "المصاب", "prefix": "m", "col": col2, "bg": bg_m}
+    ]
+
+    # ── تحميل البروتينات ──
+    for p in proteins:
+        with p["col"]:
+            if p['prefix'] == 'h':
+                icon = '🟢'
+            else:
+                icon = '🔴'
+            st.header(f"{icon} {p['label']}")
+            source = st.radio("المصدر:", ["PDB ID", "رفع ملف"], key=f"{p['prefix']}_src", horizontal=True)
+
+            if source == "PDB ID":
+                if p['prefix'] == 'm':
+                    pdb_input = st.text_input(
+                        "كود PDB:",
+                        key=f"{p['prefix']}_id_in",
+                        placeholder="مثال: 2HBS",
+                        on_change=auto_fill_healthy
+                    ).strip().upper()
+                else:
+                    pdb_input = st.text_input(
+                        "كود PDB:",
+                        key=f"{p['prefix']}_id_in",
+                        placeholder="مثال: 2HHB"
+                    ).strip().upper()
+
+                if st.button(f"تحميل {p['label']}", key=f"btn_{p['prefix']}"):
+                    with st.spinner('جاري التحميل...'):
+                        data = fetch_pdb_data(pdb_input)
+                        if data:
+                            st.session_state[f"{p['prefix']}_pdb"] = data
+                            st.session_state[f"{p['prefix']}_id"]  = pdb_input
+                            for key in ['_analysis_done', '_struct_True', '_struct_False', '_chain_sel', '_selected_chain']:
+                                st.session_state.pop(f"{p['prefix']}{key}", None)
+                            st.session_state.pop(f"focus_{p['prefix']}", None)
+                            
+                            # تحميل السليم تلقائياً إذا تم تحميل المصاب
+                            if p['prefix'] == 'm':
+                                h_id = st.session_state.get('h_id_in', '').upper().strip()
+                                if h_id and not st.session_state.get('h_pdb'):
+                                    h_data = fetch_pdb_data(h_id)
+                                    if h_data:
+                                        st.session_state["h_pdb"] = h_data
+                                        st.session_state["h_id"]  = h_id
+                                        for key in ['_analysis_done', '_struct_True', '_struct_False', '_chain_sel', '_selected_chain']:
+                                            st.session_state.pop(f"h{key}", None)
+                                        st.session_state.pop("focus_h", None)
+                        else:
+                            st.error("لم يتم العثور على البروتين")
+            else:
+                file = st.file_uploader(f"ارفع ملف {p['label']}:", type=["pdb"], key=f"{p['prefix']}_up")
+                if file:
+                    st.session_state[f"{p['prefix']}_pdb"] = file.getvalue().decode("utf-8")
+                    st.session_state[f"{p['prefix']}_id"]  = file.name
+                    for key in ['_analysis_done', '_struct_True', '_struct_False', '_chain_sel', '_selected_chain']:
+                        st.session_state.pop(f"{p['prefix']}{key}", None)
+                    st.session_state.pop(f"focus_{p['prefix']}", None)
+
+    st.divider()
+
+    # ── تهيئة الهياكل ──
+    v_col1, v_col2 = st.columns(2)
+    structures  = {}
+    chains_dict = {}
+
+    for i, p in enumerate(proteins):
+        if i == 0:
+            current_col = v_col1
+        else:
+            current_col = v_col2
+        with current_col:
+            pdb_data = st.session_state.get(f"{p['prefix']}_pdb")
+            if not pdb_data:
+                st.info(f"يرجى تحميل {p['label']}")
+                continue
+
+            st.subheader(f"هيكل {p['label']}")
+            struct_key = f"{p['prefix']}_struct_{keep_hetatm}"
+            if struct_key not in st.session_state:
+                st.session_state[struct_key] = process_protein_structure(pdb_data, "prot", keep_hetatm)
+            struct = st.session_state[struct_key]
+            structures[p['prefix']] = struct
+
+            if struct is None:
+                st.error("تعذّر قراءة البنية")
+                continue
+
+            chains = get_all_chains(struct)
+            chains_dict[p['prefix']] = chains
+            if chains:
+                selected_chain = st.selectbox(
+                    f"اختر السلسلة - {p['label']}",
+                    options=chains,
+                    key=f"{p['prefix']}_chain_sel"
+                )
+                st.session_state[f"{p['prefix']}_selected_chain"] = selected_chain
+            else:
+                st.warning("لم يتم العثور على سلاسل")
+
+    # ── حساب الطفرات ──
+    highlight_sele_m = None
+    highlight_sele_h = None
+    h_chain = st.session_state.get('h_selected_chain')
+    m_chain = st.session_state.get('m_selected_chain')
+    h_struct = structures.get('h')
+    m_struct = structures.get('m')
+
+    if h_struct and m_struct and h_chain and m_chain:
+        h_seq = get_protein_sequence(h_struct, h_chain)
+        m_seq = get_protein_sequence(m_struct, m_chain)
+        if h_seq and m_seq:
+            dict_h = {r['رقم البقية']: r['الحمض الأميني'] for r in h_seq}
+            dict_m = {r['رقم البقية']: r['الحمض الأميني'] for r in m_seq}
+            mutations_m = []
+            mutations_h = []
+            for res_num in set(dict_h) | set(dict_m):
+                if dict_h.get(res_num) != dict_m.get(res_num):
+                    if dict_m.get(res_num):
+                        mutations_m.append({'resi': str(res_num), 'chain': str(m_chain)})
+                    if dict_h.get(res_num):
+                        mutations_h.append({'resi': str(res_num), 'chain': str(h_chain)})
+            if mutations_m:
+                highlight_sele_m = mutations_m
+            else:
+                highlight_sele_m = None
+            if mutations_h:
+                highlight_sele_h = mutations_h
+            else:
+                highlight_sele_h = None
+
+    # ── العرض ثلاثي الأبعاد والتحليل ──
+    for i, p in enumerate(proteins):
+        current_col = v_col1 if i == 0 else v_col2
+        with current_col:
+            pdb_data = st.session_state.get(f"{p['prefix']}_pdb")
+            struct = structures.get(p['prefix'])
+            selected_chain = st.session_state.get(f"{p['prefix']}_selected_chain")
+            chains         = chains_dict.get(p['prefix'])
+
+            if not pdb_data or not struct or not selected_chain:
+                continue
+
+            if p['prefix'] == 'm':
+                highlight = highlight_sele_m
+                m_color = '#F44336' # Red for mutated
+                mut_list = highlight_sele_m
+            else:
+                highlight = highlight_sele_h
+                m_color = '#4CAF50' # Green for healthy
+                mut_list = highlight_sele_h
+
+            focus_mut = None
+            if highlight:
+                mut_opts = ["الكل"] + [f"Residue {m['resi']} (Chain {m['chain']})" for m in highlight]
+                sel_mut  = st.selectbox(f"🔍 التركيز على طفرة - {p['label']}", mut_opts, key=f"focus_{p['prefix']}")
+                if sel_mut != "الكل":
+                    parts     = sel_mut.split(" ")
+                    focus_mut = {'resi': parts[1], 'chain': parts[3].replace(")", "")}
+
+            if show_mutations:
+                mutations_to_show = highlight
+            else:
+                mutations_to_show = None
+
+            view_html = render_protein_3d(
+                pdb_data,
+                bg_color=p['bg'],
+                style_type=view_style,
+                show_surface=show_surf,
+                surface_opacity=surface_op,
+                mutations=mutations_to_show,
+                mut_color=m_color,
+                zoom_to_mutations=zoom_mutations,
+                focus_mut=focus_mut,
+                keep_hetatm=keep_hetatm
+            )
+            components.html(view_html, height=460)
+
+            # معلومات عامة
+            total_residues = sum(
+                len([r for r in struct[0][c] if r.id[0] == ' '])
+                for c in chains if c in [ch.id for ch in struct[0]]
+            )
+            c1, c2, c3 = st.columns(3)
+            c1.metric("عدد السلاسل", len(chains))
+            c2.metric("إجمالي الأحماض", total_residues)
+            if chains:
+                chains_label = ", ".join(chains)
+            else:
+                chains_label = "-"
+            c3.metric("السلاسل", chains_label)
+
+            # تنزيل FASTA
+            seq = get_protein_sequence(struct, selected_chain)
+            if seq:
+                with st.expander(f"🧬 تنزيل FASTA - {p['label']} (Chain {selected_chain})"):
+                    fasta_data = sequence_to_fasta(
+                        struct, selected_chain,
+                        protein_name=st.session_state.get(f"{p['prefix']}_id", p['label'])
+                    )
+                    if fasta_data:
+                        pdb_id_label = st.session_state.get(f"{p['prefix']}_id", p['label'])
+                        st.download_button(
+                            label="⬇️ تنزيل بصيغة FASTA",
+                            data=fasta_data,
+                            file_name=f"{pdb_id_label}_chain_{selected_chain}.fasta",
+                            mime="text/plain",
+                            key=f"dl_fasta_{p['prefix']}"
+                        )
+
+            # التحليل الكامل
+            st.divider()
+            analyze_key = f"{p['prefix']}_analysis_done"
+            pdb_id_key  = st.session_state.get(f"{p['prefix']}_id", "")
+
+            if st.button(
+                f"🔬 ابدأ التحليل الكامل لـ {p['label']} (Chain {selected_chain})",
+                key=f"analyze_btn_{p['prefix']}",
+                type="primary"
+            ):
+                st.session_state[analyze_key] = False
+
+            if st.session_state.get(analyze_key) is False:
+                with st.spinner(f"جاري تحليل Chain {selected_chain}..."):
+                    cache_key = f"{pdb_id_key}_{selected_chain}_r{search_radius}_het{keep_hetatm}"
+                    results = calculate_all_distances(
+                        cache_key, pdb_data, selected_chain,
+                        radius=search_radius, keep_hetatm=keep_hetatm
+                    )
+                    st.session_state[f"{p['prefix']}_results"]       = results
+                    st.session_state[f"{p['prefix']}_results_chain"] = selected_chain
+                    st.session_state[analyze_key] = True
+
+            if st.session_state.get(analyze_key) is True:
+                results       = st.session_state.get(f"{p['prefix']}_results", [])
+                results_chain = st.session_state.get(f"{p['prefix']}_results_chain", selected_chain)
+
+                if results:
+                    with st.expander(f"📊 نتائج التحليل - {p['label']} (Chain {results_chain}) — {len(results)} موضع"):
+                        df_res = pd.DataFrame(results)
+                        st.dataframe(df_res, use_container_width=True, hide_index=True)
+
+                        st.markdown("**إحصائيات سريعة:**")
+                        s1, s2, s3 = st.columns(3)
+                        s1.metric("متوسط المجاورين",    round(df_res['عدد المجاورين'].mean(), 1))
+                        s2.metric("أكثر موضع ازدحاماً", int(df_res.loc[df_res['عدد المجاورين'].idxmax(), 'Residue Num']))
+                        s3.metric("أقل موضع ازدحاماً",  int(df_res.loc[df_res['عدد المجاورين'].idxmin(), 'Residue Num']))
+
+                        csv_data = df_res.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="⬇️ تنزيل بصيغة CSV",
+                            data=csv_data,
+                            file_name=f"full_analysis_{pdb_id_key}_chain_{results_chain}.csv",
+                            mime="text/csv",
+                            key=f"dl_csv_{p['prefix']}"
+                        )
+                else:
+                    st.warning("لم تُعثر على نتائج للتحليل")
+
+    # ============================
+    # قسم المقارنة
+    # ============================
+    h_chain = st.session_state.get("h_selected_chain")
+    m_chain = st.session_state.get("m_selected_chain")
+
+    if 'h' in structures and 'm' in structures and structures['h'] and structures['m'] and h_chain and m_chain:
+        h_seq = get_protein_sequence(structures['h'], h_chain)
+        m_seq = get_protein_sequence(structures['m'], m_chain)
+
+        if h_seq and m_seq:
+            df_h = pd.DataFrame(h_seq).rename(columns={'الحمض الأميني': 'السليم'})
+            df_m = pd.DataFrame(m_seq).rename(columns={'الحمض الأميني': 'المصاب'})
+            df_compare = pd.merge(df_h, df_m, on='رقم البقية', how='outer').sort_values('رقم البقية')
+            df_compare = df_compare.astype(object).fillna('-')
+            df_compare['تغيّر؟'] = df_compare.apply(
+                lambda row: '🔴 طفرة' if row['السليم'] != row['المصاب'] else '🟢 محافظ', axis=1
+            )
+            df_compare = df_compare[['رقم البقية', 'السليم', 'المصاب', 'تغيّر؟']]
+
+            def highlight_diff(row):
+                if row['السليم'] != row['المصاب']:
+                    return ['background-color: #c62828; color: white'] * len(row)
+                return [''] * len(row)
+
+            with st.expander("📋 الجدول الكامل"):
+                st.dataframe(df_compare.style.apply(highlight_diff, axis=1),
+                             use_container_width=True, hide_index=True)
+        else:
+            st.warning("لم يتم العثور على تسلسل في إحدى السلسلتين المختارتين.")
+
+        # ── Alignment ──
+        st.divider()
+        st.header(f"🧬 Alignment بين السليم والمصاب ({align_mode.capitalize()} Alignment)")
+
+        if h_seq and m_seq:
+            h_seq_str = "".join([AA_3TO1.get(r['الحمض الأميني'], 'X') for r in h_seq])
+            m_seq_str = "".join([AA_3TO1.get(r['الحمض الأميني'], 'X') for r in m_seq])
+
+            aln_text, score, aln1, aln2 = get_alignment(h_seq_str, m_seq_str, mode=align_mode)
+            matches = sum(a == b and a != '-' for a, b in zip(aln1, aln2))
+            if len(aln1) > 0:
+                identity = matches / len(aln1) * 100
+            else:
+                identity = 0
+
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Alignment Score", score)
+            sc2.metric("Identity %", f"{identity:.2f}%")
+            sc3.metric("فرق الطول", abs(len(h_seq_str) - len(m_seq_str)))
+
+            st.markdown("### 🧬 مقارنة التسلسل (Alignment)")
+            st.code(aln_text, language='text')
+        else:
+            st.warning("لا يمكن إجراء Alignment لأن أحد التسلسلين غير موجود.")
+
+
+if __name__ == "__main__":
+    main()
